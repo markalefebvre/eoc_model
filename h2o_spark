@@ -1,0 +1,804 @@
+
+import h2o
+
+from datetime import datetime
+
+from pytz import timezone
+
+from pyspark import SparkContext, SparkConf, SparkFiles
+
+from pyspark.sql import SQLContext, Row, SparkSession
+
+import os
+
+import sys
+
+from pysparkling import *
+
+from pyspark.sql import Column as col
+
+from pyspark.sql import functions as F
+
+from pyspark.sql.functions import udf
+
+from pyspark.sql.types import *
+
+from itertools import compress
+
+import math
+
+import boto3
+
+import json
+
+import traceback
+
+ 
+
+#
+
+ 
+
+os.environ['PYTHON_EGG_CACHE'] = '/tmp/.python-eggs/'
+
+os.environ['PYTHON_EGG_DIR']='/tmp/.python-eggs/'
+
+ 
+
+threshold = .2
+
+ENVIRONMENT = 'ches-episodeOfCare'
+
+CW_NAMESPACE = "DataSciences/%s/PI-PrePay-Selection-Enhancement" % ENVIRONMENT
+
+T0 = datetime.now()
+
+ 
+
+# replace . with _, replace \space\ with _
+
+charReplacements = ('.','_'),(' ','_')
+
+ 
+
+roundFloat = lambda x: round(x, 7) if type(x) is float else float(0)
+
+roundFloatUDF = udf(roundFloat, FloatType())
+
+ 
+
+def renameCol(x):
+
+                return reduce(lambda a,kv : a.replace(*kv),charReplacements,x)
+
+ 
+
+def loadData(sc, path):
+
+                df = sc.read.csv(path, header=True, inferSchema=True)
+
+                # replace any '.' or 'space' in column name with _ , rename column
+
+                #for i in df.columns:
+
+                                #df = df.withColumnRenamed(i,renameCol(i))
+
+                return df
+
+ 
+
+def trainModel(sc, h2oContext, trainingData):
+
+ 
+
+                sys.setrecursionlimit(2000)
+
+ 
+
+                colNames = trainingData.columns
+
+                nonBinaryColNames = ["ch_member_id",
+
+                                "gender",
+
+                                "unique_proc_cnt",
+
+                                "pcp_visit_cnt",
+
+                                "pcp_visit_spend",
+
+                                "pcp_ind",
+
+                                "spec_visit_cnt",
+
+                                "spec_visit_spend",
+
+                                "spec_un_prov_cnt",
+
+                                "ov_visit_cnt",
+
+                                "ov_spend",
+
+                                "ct_visit_cnt",
+
+                                "ct_spend",
+
+                                "mri_visit_cnt",
+
+                                "mri_spend",
+
+                                "xray_visit_cnt",
+
+                                "xray_spend",
+
+                                "diag_ind",
+
+                                "inj_visit_cnt",
+
+                                "inj_spend",
+
+                                "asp_visit_cnt",
+
+                                "asp_spend",
+
+                                "pain_rx_ind",
+
+                                "age",
+
+                                "target"]
+
+ 
+
+                binaryColNames = [c for c in colNames if c not in nonBinaryColNames]
+
+                sumBinaryColumns = trainingData.groupBy().agg(*(F.sum(col(c)).alias(c) for c in binaryColNames))
+
+ 
+
+                tupleValues = tuple(sumBinaryColumns.first())
+
+                sumValues = list(tupleValues)
+
+ 
+
+                totalBinaryCols = len(sumValues)
+
+                keepPercentage = math.ceil(totalBinaryCols * threshold) + 1
+
+ 
+
+                combinedList = zip(sumValues, binaryColNames)
+
+ 
+
+                combinedList.sort()
+
+                cleaned = [i[1] for i in combinedList]
+
+ 
+
+                binaryColsAboveThreshold = cleaned[:int(keepPercentage)]
+
+ 
+
+                masterAllCols = [c for c in colNames if c in binaryColsAboveThreshold or c in nonBinaryColNames]
+
+ 
+
+                newFrame = trainingData.select(masterAllCols)
+
+ 
+
+                h2oData = h2oContext.as_h2o_frame(newFrame)
+
+ 
+
+                h2oData['gender'] = h2oData['gender'].asfactor()
+
+                h2oData['target'] = h2oData['target'].asfactor()
+
+ 
+
+                for c in binaryColsAboveThreshold:
+
+                                h2oData[c] = h2oData[c].asfactor()
+
+ 
+
+                splits = h2oData.split_frame(ratios=[0.8])
+
+                train = splits[0]
+
+                test = splits[1]
+
+ 
+
+                predictor_columns = [c for c in train.drop("target").col_names if c not in "ch_member_id"]
+
+                response_column = "target"
+
+ 
+
+                # Create and train GBM model
+
+                from h2o.estimators.random_forest import H2ORandomForestEstimator
+
+                print "loading model"
+
+                # Prepare model based on the given set of parameters
+
+ 
+
+ 
+
+                drf_model = H2ORandomForestEstimator(  ntrees       = 500,
+
+                                                                                                                                max_depth    = 12,
+
+                                                                                                                                balance_classes=True,
+
+                                                                                                                                nfolds=5
+
+                                                                                                                                )
+
+ 
+
+                # Train the model
+
+                drf_model.train(x                = predictor_columns,
+
+                                                                                y                = response_column,
+
+                                                                                training_frame   = train,
+
+                                                                                validation_frame = test
+
+                                                                                )
+
+ 
+
+                print drf_model.model_performance()
+
+ 
+
+                #f1.write(drf_model.model_performance())
+
+                #f1.close()
+
+ 
+
+                return drf_model
+
+ 
+
+ 
+
+def scoreData(sc, h2oContext, model, scoringData, path ):
+
+                h2oData = h2oContext.as_h2o_frame(scoringData)
+
+ 
+
+ 
+
+                h2oData['gender'] = h2oData['gender'].asfactor()
+
+                h2oData['target'] = h2oData['target'].asfactor()
+
+ 
+
+                predictions = model.predict(h2oData)
+
+                h2oData['prediction'] = predictions['proc']
+
+                delattr(h2oData, "_java_frame")
+
+                predsSparkDF = h2oContext.as_spark_frame(h2oData)
+
+                returnPreds = predsSparkDF.select(["ch_member_id","prediction"])
+
+                print predictions
+
+                writeData = returnPreds.coalesce(1)
+
+                writeDataClean = writeData.withColumn("prediction", roundFloatUDF(writeData["prediction"]))
+
+                writeDataClean.write.format("csv").mode('overwrite').save(path)
+
+ 
+
+                return returnPreds
+
+ 
+
+ 
+
+def computeQuantiles(h2oContext, scoredData):
+
+                """
+
+                computes the five number summary of predicted probabilities
+
+                for a binary classifier
+
+                :returns:
+
+                                list of 5 number summary
+
+                """
+
+                h2oOutput = h2oContext.as_h2o_frame(scoredData)
+
+                quantiles = h2oOutput[-1].quantile()
+
+                fiveNumbers = quantiles[quantiles['Probs'].isin(
+
+                                [0.01, 0.25, 0.5, 0.75, 0.99])].as_data_frame()
+
+                fiveNumberList = [float(x[1]) for x in fiveNumbers[1:]]
+
+ 
+
+                return fiveNumberList
+
+ 
+
+ 
+
+def computeRatioOfClasses(h2oContext, model, scoredData):
+
+                """
+
+                computes the ratio of positively classified to negatively
+
+                classified data points
+
+                :returns:
+
+                                ratio of classes as a float
+
+                """
+
+                threshold = model.find_threshold_by_max_metric('accuracy')
+
+                h2oOutput = h2oContext.as_h2o_frame(scoredData)
+
+                n = len(h2oOutput)
+
+                nPositive = len(h2oOutput[h2oOutput[-1] > threshold])
+
+                ratioOfClasses = float(nPositive)/(n - nPositive)
+
+ 
+
+                return ratioOfClasses
+
+ 
+
+ 
+
+def getModelingMetrics(h2oContext, model, scoredData):
+
+                """
+
+                computes various metrics to describe the modeling performed
+
+                :returns:
+
+                                dict of metrics to send to cloudwatch
+
+                """
+
+                metrics = {
+
+                                'Records': scoredData.count(),
+
+                                'Duration': (datetime.now() - T0).seconds,
+
+                                'AUC': model.auc(valid=True),
+
+                                'Log Loss': model.logloss(valid=True),
+
+                                'MSE': model.mse(valid=True),
+
+                                #need to figure out how to send/interpret distributional statistics
+
+                                #with cloudwatch
+
+                                # 'five_number_summary': computeQuantiles(
+
+                                #             h2oContext=h2oContext,
+
+                                #             model=model,
+
+                                #             scoredData=scoredData
+
+                                # )
+
+                                'Ratio of Classes': computeRatioOfClasses(
+
+                                                h2oContext=h2oContext,
+
+            model=model,
+
+                                                scoredData=scoredData
+
+                                )
+
+                }
+
+ 
+
+                return metrics
+
+ 
+
+def getRocMetrics(spark, h2oContext, model, path):
+
+                """
+
+                computes counts, sensitivity, specificity for range of discrimination thresholds
+
+                :returns:
+
+                                dict of ROC-related metricsc to output to train, valid, and xval data lakes
+
+                """
+
+                threshLo = 0
+
+                threshHi = 100
+
+                discrimThresh = [(x * 0.01) for x in range(threshLo, threshHi)]
+
+               
+
+                sens = model.sensitivity(thresholds = discrimThresh, train = True, valid = True, xval = True)
+
+                #print sens
+
+                sensTrain = sens[u'train']
+
+                sensValid = sens[u'valid']
+
+                sensXval = sens[u'xval']
+
+               
+
+                spec = model.specificity(thresholds = discrimThresh, train = True, valid = True, xval = True)
+
+                specTrain = spec[u'train']
+
+                specValid = spec[u'valid']
+
+                specXval = spec[u'xval']
+
+                   
+
+                cf = model.confusion_matrix(thresholds = discrimThresh, train = True, valid = True, xval = True)
+
+                cfTrain = cf[u'train']
+
+                cfValid = cf[u'valid']
+
+                cfXval = cf[u'xval']
+
+               
+
+                threshIndex = range(0, len(discrimThresh))
+
+                #print threshIndex
+
+                rocMetricsTrain = []
+
+                for j in threshIndex:
+
+                   
+
+                    tn = tuple(cfTrain[j].to_list())[0][0]
+
+                    fp = tuple(cfTrain[j].to_list())[0][1]
+
+                    fn = tuple(cfTrain[j].to_list())[1][0]
+
+                    tp = tuple(cfTrain[j].to_list())[1][1]
+
+                   
+
+                    sn = tuple(sensTrain[j])[1]
+
+                    sp = tuple(specTrain[j])[1]
+
+                   
+
+                    #print cfTrain[j]
+
+                    #print sensTrain[j]
+
+                    #print specTrain[j]
+
+                    #print [tn, fp, fn, tp, sn, sp]
+
+                    rocMetrics = (str(discrimThresh[j]), tn, fp, fn, tp, sn, sp)
+
+                    #print rocMetrics
+
+                    rocMetricsTrain.append(rocMetrics)
+
+                    #print rocMetricsTrain
+
+               
+
+                rocMetricsValid = []
+
+                for j in threshIndex:
+
+                   
+
+                    tn = tuple(cfValid[j].to_list())[0][0]
+
+                    fp = tuple(cfValid[j].to_list())[0][1]
+
+                    fn = tuple(cfValid[j].to_list())[1][0]
+
+                    tp = tuple(cfValid[j].to_list())[1][1]
+
+                   
+
+                    sn = tuple(sensValid[j])[1]
+
+                    sp = tuple(specValid[j])[1]
+
+                   
+
+                    rocMetrics = (str(discrimThresh[j]), tn, fp, fn, tp, sn, sp)
+
+                    #print rocMetrics
+
+                    rocMetricsValid.append(rocMetrics)
+
+                    #print rocMetricsValid
+
+               
+
+                rocMetricsXval = []
+
+                for j in threshIndex:
+
+                   
+
+                    tn = tuple(cfXval[j].to_list())[0][0]
+
+                    fp = tuple(cfXval[j].to_list())[0][1]
+
+                    fn = tuple(cfXval[j].to_list())[1][0]
+
+                    tp = tuple(cfXval[j].to_list())[1][1]
+
+                   
+
+                    sn = tuple(sensXval[j])[1]
+
+                    sp = tuple(specXval[j])[1]
+
+                   
+
+                    rocMetrics = (str(discrimThresh[j]), tn, fp, fn, tp, sn, sp)
+
+                    #print rocMetrics
+
+                    rocMetricsXval.append(rocMetrics)
+
+                    #print rocMetricsXval
+
+ 
+
+                #print rocMetricsTrain
+
+                #print rocMetricsValid
+
+                #print rocMetricsXval
+
+                #print type(rocMetricsXval)
+
+               
+
+                dfRocMetricsTrain = spark.createDataFrame(rocMetricsTrain, schema = ["discriminationThreshold", "tnCount", "fpCount", "fnCount", "tpCount", "sensitivity", "specificity"])
+
+                dfRocMetricsValid = spark.createDataFrame(rocMetricsValid, schema = ["discriminationThreshold", "tnCount", "fpCount", "fnCount", "tpCount", "sensitivity", "specificity"])
+
+                dfRocMetricsXval = spark.createDataFrame(rocMetricsXval, schema = ["discriminationThreshold", "tnCount", "fpCount", "fnCount", "tpCount", "sensitivity", "specificity"])
+
+                #print dfRocMetricsXval
+
+               
+
+                dfRocMetricsTrain.coalesce(1).write.format("csv").mode('overwrite').save(path + "train_roc_csv")
+
+                dfRocMetricsValid.coalesce(1).write.format("csv").mode('overwrite').save(path + "test_roc_csv")
+
+                dfRocMetricsXval.coalesce(1).write.format("csv").mode('overwrite').save(path + "validate_roc_csv")
+
+               
+
+                #rocMetrics = {rocMetricsTrain, rocMetricsValid, rocMetricsXval}
+
+                #return dfRocMetricsTrain, dfRocMetricsValid, dfRocMetricsXval
+
+ 
+
+def sendMetricsToCloudwatch(metrics, namespace='ches-test'):
+
+                """
+
+                sends the computed modeling metrics to cloudwatch
+
+                """
+
+                timestamp = datetime.now()
+
+                cloudWatch = boto3.client('cloudwatch', region_name='us-east-1')
+
+                for metricName, metricValue in metrics.items():
+
+                                cloudWatch.put_metric_data(
+
+                                                Namespace=namespace,
+
+                                                MetricData=[
+
+                                                                {
+
+                                                                                'MetricName': metricName,
+
+                                                                                'Timestamp': timestamp,
+
+                                                                                'Value': metricValue
+
+                                                                }
+
+                                                ]
+
+                                )
+
+ 
+
+ 
+
+def writeResults(sc, scoredData, model, localMode, path):
+
+                writeData = scoredData.coalesce(1)
+
+                writeData.write.format("csv").mode('overwrite').save(path)
+
+ 
+
+ 
+
+def sendSNSMessage(arn, bundle, output=None):
+
+                """
+
+                sends success or failure message to ches arn on SNS
+
+                """
+
+                sns = boto3.client('sns', region_name='us-east-1')
+
+                if output:
+
+                                message = {
+
+                                                'status': 'success',
+
+                                                'bundle': bundle,
+
+                                                'output': output
+
+                                }
+
+                else:
+
+                                message = {
+
+                                                'status': 'failure',
+
+                                                'bundle': bundle
+
+                                }
+
+ 
+
+                sns.publish(
+
+                                TopicArn=arn,
+
+                                Message=json.dumps(message)
+
+                )
+
+ 
+
+ 
+
+def main():
+
+                try:
+
+                                trainingPath = sys.argv[1]
+
+                                scorePath = sys.argv[2]
+
+                                writePath = sys.argv[3]
+
+                                arn = sys.argv[4]
+
+                                bundle = sys.argv[5]
+
+                                writePathRocMetrics = sys.argv[6]
+
+                                spark = SparkSession.builder.appName("ches-training").getOrCreate()
+
+ 
+
+                                # Start H2O services
+
+                                h2oContext = H2OContext.getOrCreate(spark.sparkContext)
+
+ 
+
+                                loadedTrainingData = loadData(spark, trainingPath)
+
+                                loadedScoringData = loadData(spark, scorePath)
+
+                                model = trainModel(spark, h2oContext, loadedTrainingData)
+
+                                scoredData = scoreData(spark, h2oContext, model, loadedScoringData, writePath)
+
+                                #writeResults(spark, scoredData, model,'no', writePath)
+
+ 
+
+                                # Compute metrics and send to cloudwatch
+
+                                output = spark.read.csv(writePath, header=False, inferSchema=True)
+
+                                metrics = getModelingMetrics(h2oContext, model, output)
+
+                                sendMetricsToCloudwatch(metrics)
+
+                               
+
+                                # Compute ROC Metrics and save
+
+                                getRocMetrics(spark, h2oContext, model, writePathRocMetrics)
+
+ 
+
+                                # Send SNS success message
+
+                                sendSNSMessage(arn, bundle, writePath)
+
+ 
+
+                                #h2o.shutdown(prompt=False)
+
+                                #spark.stop()
+
+                except Exception as e:
+
+                                traceback.print_exc()
+
+                                # Send SNS failure message
+
+                                sendSNSMessage(arn, bundle)
+
+                                sys.exit(1)
+
+ 
+
+ 
+
+if __name__== "__main__":
+
+                main()
